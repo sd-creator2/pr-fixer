@@ -1,0 +1,14 @@
+{
+  "name": "ai-fix-github-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GitHub PR webhook bot that calls the DeepSeek API and pushes fixes.",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test test/index.test.js"
+  }
+}
