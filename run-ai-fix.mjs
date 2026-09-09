@@ -314,6 +314,16 @@ function extractPatch(content) {
   };
 }
 
+function patchVariants(patch) {
+  const variants = [String(patch ?? "")];
+  const cleaned = variants[0]
+    .split("\n")
+    .filter((line) => line.trim() !== "" && !/^```/.test(line))
+    .join("\n");
+  if (cleaned !== variants[0]) variants.push(cleaned);
+  return variants;
+}
+
 async function callDeepSeek(prompt) {
   if (!config.deepseekApiKey) fail("DEEPSEEK_API_KEY is not set");
   const systemPrompt = [
@@ -325,6 +335,8 @@ async function callDeepSeek(prompt) {
     "- Include every file you changed, with correct context lines.",
     "- Do not add markdown fences, prose outside the JSON, or truncated diffs.",
     "- If no code changes are needed, return a JSON object with an empty patch.",
+    "- Inside hunks, every content line must start with exactly one of: a space (context), '-' (removed), '+' (added); never leave empty lines inside a hunk.",
+    "- If the requested action is not a code change (for example merging a branch or answering a question), return an empty patch.",
   ].join("\n");
   const response = await fetch(`${config.deepseekBaseUrl}/chat/completions`, {
     method: "POST",
@@ -359,37 +371,61 @@ async function callDeepSeek(prompt) {
 
 async function applyPatch(checkoutDir, patch) {
   if (!patch.trim()) return false;
-  const patchFile = path.join(checkoutDir, ".ai-fix.patch");
-  await fs.writeFile(patchFile, patch, "utf8");
-  try {
-    await git(checkoutDir, ["apply", "--whitespace=nowarn", patchFile]);
-  } finally {
-    await fs.rm(patchFile, { force: true });
+  let lastError = null;
+  for (const candidate of patchVariants(patch)) {
+    if (!candidate.trim()) continue;
+    const patchFile = path.join(checkoutDir, ".ai-fix.patch");
+    await fs.writeFile(patchFile, candidate, "utf8");
+    try {
+      await git(checkoutDir, ["apply", "--recount", "--whitespace=nowarn", patchFile]);
+      return true;
+    } catch (error) {
+      lastError = error;
+    } finally {
+      await fs.rm(patchFile, { force: true });
+    }
   }
-  return true;
+  throw lastError ?? fail("git apply failed");
 }
 
 async function runFix(checkoutDir, prompt) {
-  const firstContent = await callDeepSeek(prompt);
-  let parsed = extractPatch(firstContent);
+  let retried = false;
+  let content = await callDeepSeek(prompt);
 
-  if (parsed.patch.trim()) {
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const parsed = extractPatch(content);
+
+    if (!parsed.patch.trim()) {
+      return { ...parsed, retried };
+    }
+
+    console.log(
+      `ai-fix: attempt ${attempt} returned a patch of ${parsed.patch.length} chars; summary: ${truncate(parsed.summary || "(none)", 200)}`,
+    );
     try {
       await applyPatch(checkoutDir, parsed.patch);
-      return { ...parsed, retried: false };
+      return { ...parsed, retried };
     } catch (error) {
+      console.error(`ai-fix: git apply failed on attempt ${attempt}: ${error.message}`);
+      console.error(
+        `ai-fix: full model response on attempt ${attempt} was:\n${truncate(content, 8000)}`,
+      );
+      if (attempt === 2) {
+        throw new Error(
+          `ai-fix produced a diff that git apply rejected on both attempts. The full model responses are printed in the run log above. Last error: ${error.message}`,
+        );
+      }
+      retried = true;
       const retryPrompt = `${prompt}
 
 Your previous diff did not apply. Correct it and return a new JSON patch that addresses the failure.
 git apply error:
 ${error.message}`;
-      const secondContent = await callDeepSeek(retryPrompt);
-      parsed = extractPatch(secondContent);
-      await applyPatch(checkoutDir, parsed.patch);
-      return { ...parsed, retried: true };
+      content = await callDeepSeek(retryPrompt);
     }
   }
-  return { ...parsed, retried: false };
+
+  throw new Error("runFix did not complete");
 }
 
 async function commitAndPush(checkoutDir, remoteRef, summary) {
@@ -535,6 +571,7 @@ async function runFromAction() {
 export {
   buildFixPrompt,
   extractPatch,
+  patchVariants,
 };
 
 const isMain =

@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   buildFixPrompt,
   extractPatch,
+  patchVariants,
 } from "../run-ai-fix.mjs";
 
 test("extractPatch parses plain JSON responses", () => {
@@ -92,4 +93,30 @@ test("buildFixPrompt includes review feedback and changed files", () => {
   assert.match(prompt, /PR #12/);
   assert.match(prompt, /Validate the input/);
   assert.match(prompt, /server\.js \(modified\)/);
+});
+
+test("patchVariants keeps the original patch first", () => {
+  const patch = "diff --git a/x b/x\nindex a..b 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new";
+  const variants = patchVariants(patch);
+  assert.equal(variants[0], patch);
+  assert.equal(variants.length, 1);
+});
+
+test("patchVariants drops empty and fence lines", () => {
+  const patch = [
+    "diff --git a/x b/x",
+    "index a..b 100644",
+    "--- a/x",
+    "+++ b/x",
+    "@@ -1,3 +1,3 @@",
+    "-old",
+    "",
+    "```diff",
+    "+new",
+  ].join("\n");
+  const variants = patchVariants(patch);
+  assert.ok(variants.length >= 2);
+  const cleaned = variants[variants.length - 1].split("\n");
+  assert.ok(!cleaned.includes(""));
+  assert.ok(!cleaned.some((line) => line.startsWith("```")));
 });
