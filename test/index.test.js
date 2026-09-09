@@ -1,11 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import crypto from "node:crypto";
 import {
   buildFixPrompt,
   extractPatch,
-  verifyWebhookSignature,
-} from "../index.js";
+} from "../run-ai-fix.mjs";
 
 test("extractPatch parses plain JSON responses", () => {
   const patch = [
@@ -94,14 +92,4 @@ test("buildFixPrompt includes review feedback and changed files", () => {
   assert.match(prompt, /PR #12/);
   assert.match(prompt, /Validate the input/);
   assert.match(prompt, /server\.js \(modified\)/);
-});
-
-test("verifyWebhookSignature compares SHA-256 signatures", () => {
-  const body = Buffer.from('{"ok":true}');
-  const valid =
-    "sha256=" +
-    crypto.createHmac("sha256", "secret").update(body).digest("hex");
-  assert.equal(verifyWebhookSignature("secret", body, valid), true);
-  assert.equal(verifyWebhookSignature("secret", body, "sha256=wrong"), false);
-  assert.equal(verifyWebhookSignature("", body, valid), false);
 });

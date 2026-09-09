@@ -1,7 +1,5 @@
 #!/usr/bin/env node
 
-import http from "node:http";
-import crypto from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
@@ -15,15 +13,9 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 await loadDotEnv(path.join(scriptDir, ".env"));
 
 const config = {
-  port: Number(env("PORT", "8787")),
   githubToken: env("GITHUB_TOKEN"),
   githubApi: stripTrailingSlash(env("GITHUB_API_URL", "https://api.github.com")),
   githubUsername: env("GITHUB_USERNAME", "x-access-token"),
-  webhookSecret: env("GITHUB_WEBHOOK_SECRET"),
-  allowedRepos: env("ALLOWED_REPOS")
-    .split(",")
-    .map((item) => item.trim().toLowerCase())
-    .filter(Boolean),
   deepseekApiKey: env("DEEPSEEK_API_KEY"),
   deepseekBaseUrl: stripTrailingSlash(
     env("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
@@ -31,15 +23,14 @@ const config = {
   deepseekModel: env("DEEPSEEK_MODEL", "deepseek-chat"),
   deepseekMaxTokens: Number(env("DEEPSEEK_MAX_TOKENS", "8000")),
   maxContextChars: Number(env("MAX_CONTEXT_CHARS", "120000")),
-  workDir: env("WORK_DIR", path.join(os.tmpdir(), "ai-fix-github-bot")),
+  workDir: env("WORK_DIR", path.join(os.tmpdir(), "ai-fix-github-action")),
   gitName: env("GIT_NAME", "ai-fix[bot]"),
   gitEmail: env("GIT_EMAIL", "ai-fix[bot]@users.noreply.github.com"),
 };
 
-const activeJobs = new Set();
 const ghHeaders = {
   Accept: "application/vnd.github+json",
-  "User-Agent": "ai-fix-github-bot",
+  "User-Agent": "ai-fix-github-action",
 };
 
 function env(name, fallback = "") {
@@ -85,9 +76,16 @@ function truncate(text, maxLength) {
   return `${value.slice(0, Math.floor(maxLength * 0.7))}\n...[truncated]...\n${value.slice(-Math.floor(maxLength * 0.3))}`;
 }
 
-async function requestJson(url, options = {}) {
-  const headers = { ...ghHeaders, ...(options.headers ?? {}) };
-  const response = await fetch(url, { ...options, headers });
+async function githubApi(pathname, options = {}) {
+  const url = `${config.githubApi}${pathname}`;
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      ...ghHeaders,
+      Authorization: `Bearer ${config.githubToken}`,
+      ...(options.headers ?? {}),
+    },
+  });
   const bodyText = await response.text();
   if (!response.ok) {
     fail(`GitHub API ${response.status} for ${url}: ${truncate(bodyText, 2000)}`);
@@ -127,37 +125,6 @@ async function ghPaged(pathname, perPage = 100) {
     if (page > 20) break;
   }
   return items;
-}
-
-async function githubApi(pathname) {
-  return requestJson(`${config.githubApi}${pathname}`, {
-    headers: { Authorization: `Bearer ${config.githubToken}` },
-  });
-}
-
-function verifyWebhookSignature(secret, rawBody, signatureHeader) {
-  if (!secret || !signatureHeader) return false;
-  const expected = `sha256=${crypto
-    .createHmac("sha256", secret)
-    .update(rawBody)
-    .digest("hex")}`;
-  const expectedBuffer = Buffer.from(expected);
-  const receivedBuffer = Buffer.from(signatureHeader);
-  return (
-    expectedBuffer.length === receivedBuffer.length &&
-    crypto.timingSafeEqual(expectedBuffer, receivedBuffer)
-  );
-}
-
-async function readBody(request) {
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of request) {
-    size += chunk.length;
-    if (size > 5 * 1024 * 1024) fail("Request body too large");
-    chunks.push(chunk);
-  }
-  return Buffer.concat(chunks);
 }
 
 async function git(cwd, args, authToken = null) {
@@ -234,7 +201,9 @@ function buildFixPrompt({
   maxChars,
 }) {
   const parts = [];
-  const triggerText = triggerComment.body.replace(/^\s*\/ai-fix\b/i, "").trim();
+  const triggerText = (triggerComment.body ?? "")
+    .replace(/^\s*\/ai-fix\b/i, "")
+    .trim();
   parts.push(
     `Repository: ${pullRequest.base.repo.full_name}`,
     `PR #${pullRequest.number}: ${pullRequest.title}`,
@@ -339,7 +308,10 @@ function extractPatch(content) {
   }
   const patch = cleanPatch(patchLines.join("\n"));
   const prefix = candidate.slice(0, diffStart);
-  return { summary: truncate(prefix.replace(/[`"'{}[\]]/g, "").trim(), 1000), patch };
+  return {
+    summary: truncate(prefix.replace(/[`"'{}[\]]/g, "").trim(), 1000),
+    patch,
+  };
 }
 
 async function callDeepSeek(prompt) {
@@ -439,6 +411,15 @@ async function commitAndPush(checkoutDir, remoteRef, summary) {
   return { pushed: true, sha };
 }
 
+async function createIssueComment(repoFullName, issueNumber, body) {
+  const [owner, repo] = repoFullName.split("/");
+  await githubApi(`/repos/${owner}/${repo}/issues/${issueNumber}/comments`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body }),
+  });
+}
+
 async function collectContext(owner, repo, pullNumber, triggerCommentId) {
   const pullRequest = await githubApi(
     `/repos/${owner}/${repo}/pulls/${pullNumber}`,
@@ -459,68 +440,13 @@ async function collectContext(owner, repo, pullNumber, triggerCommentId) {
       !botNames.includes(comment.user?.login) &&
       !/^\s*\/ai-fix\b/i.test(comment.body ?? ""),
   );
-  return { pullRequest, triggerComment, files, reviewComments, conversationComments: otherComments };
-}
-
-async function handleIssueComment(payload) {
-  if (payload.action !== "created" && payload.action !== "edited") return;
-  if (!payload.issue?.pull_request) return;
-  const commentBody = payload.comment?.body ?? "";
-  if (!/^\s*\/ai-fix\b/i.test(commentBody)) return;
-
-  const repo = payload.repository;
-  if (!repo?.full_name || !payload.issue?.number) {
-    fail("Webhook payload is missing repository or PR number");
-  }
-  const repoFullName = repo.full_name;
-  const repoKey = repoFullName.toLowerCase();
-  if (config.allowedRepos.length > 0 && !config.allowedRepos.includes(repoKey)) {
-    console.log(`Ignoring /ai-fix for repo outside ALLOWED_REPOS: ${repo.full_name}`);
-    return;
-  }
-
-  const jobKey = `${repoKey}#${payload.issue.number}`;
-  if (activeJobs.has(jobKey)) {
-    console.log(`Already running for ${jobKey}, skipping duplicate trigger`);
-    return;
-  }
-  activeJobs.add(jobKey);
-  try {
-    await processPullRequest(repoFullName, payload.issue.number, payload.comment.id);
-  } catch (error) {
-    console.error(`ai-fix failed for ${repoKey}#${payload.issue.number}:`, error);
-    try {
-      await createIssueComment(
-        repoFullName,
-        payload.issue.number,
-        `ai-fix failed:\n\n${truncate(error.message, 4000)}`,
-      );
-    } catch {
-      // Best effort: a failure to comment should not mask the original error.
-    }
-  } finally {
-    activeJobs.delete(jobKey);
-  }
-}
-
-async function createIssueComment(repoFullName, issueNumber, body) {
-  const [owner, repo] = repoFullName.split("/");
-  const response = await fetch(
-    `${config.githubApi}/repos/${owner}/${repo}/issues/${issueNumber}/comments`,
-    {
-      method: "POST",
-      headers: {
-        ...ghHeaders,
-        Authorization: `Bearer ${config.githubToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ body }),
-    },
-  );
-  const responseText = await response.text();
-  if (!response.ok) {
-    fail(`Comment failed (${response.status}): ${truncate(responseText, 2000)}`);
-  }
+  return {
+    pullRequest,
+    triggerComment,
+    files,
+    reviewComments,
+    conversationComments: otherComments,
+  };
 }
 
 async function processPullRequest(repoFullName, pullNumber, commentId) {
@@ -528,9 +454,16 @@ async function processPullRequest(repoFullName, pullNumber, commentId) {
   const { pullRequest, triggerComment, files, reviewComments, conversationComments } =
     await collectContext(owner, repo, pullNumber, commentId);
 
-  if (pullRequest.head?.repo?.full_name !== repoFullName) {
+  if (!/^\s*\/ai-fix\b/i.test(triggerComment.body ?? "")) {
+    console.log("Comment is not an /ai-fix command, skipping.");
+    return;
+  }
+  if (
+    (pullRequest.head?.repo?.full_name ?? "").toLowerCase() !==
+    repoFullName.toLowerCase()
+  ) {
     fail(
-      "PRs from forks are not supported because this bot pushes with a token scoped to the base repository",
+      "PRs from forks are not supported because the workflow token cannot push to the fork",
     );
   }
   if (!pullRequest.head?.sha || !pullRequest.head?.ref) {
@@ -572,68 +505,36 @@ async function processPullRequest(repoFullName, pullNumber, commentId) {
   console.log(result);
 }
 
-async function handleWebhook(event, rawBody) {
-  const payload = JSON.parse(rawBody.toString("utf8"));
-  if (event === "issue_comment") {
-    await handleIssueComment(payload);
-  }
-}
-
-function sendResponse(response, statusCode, body = "") {
-  response.writeHead(statusCode, { "Content-Type": "text/plain; charset=utf-8" });
-  response.end(body);
-}
-
-async function main() {
+async function runFromAction() {
+  const repoFullName = env("GITHUB_REPOSITORY");
+  const pullNumber = env("PR_NUMBER");
+  const commentId = Number(env("COMMENT_ID", "0"));
   if (!config.githubToken) fail("GITHUB_TOKEN is not set");
-  if (!config.webhookSecret) fail("GITHUB_WEBHOOK_SECRET is not set");
-  await fs.mkdir(config.workDir, { recursive: true });
+  if (!repoFullName || !pullNumber) {
+    fail("GITHUB_REPOSITORY and PR_NUMBER are required");
+  }
 
-  const server = http.createServer((request, response) => {
-    const url = new URL(request.url, `http://${request.headers.host}`);
-    if (request.method === "GET" && url.pathname === "/healthz") {
-      sendResponse(response, 200, "ok");
-      return;
+  console.log(`Handling PR ${repoFullName}#${pullNumber}`);
+  try {
+    await processPullRequest(repoFullName, Number(pullNumber), commentId);
+  } catch (error) {
+    console.error("ai-fix failed:", error);
+    try {
+      await createIssueComment(
+        repoFullName,
+        Number(pullNumber),
+        `ai-fix failed:\n\n${truncate(error.message, 4000)}`,
+      );
+    } catch {
+      // The run itself is the failure record when commenting is not possible.
     }
-    if (request.method !== "POST" || url.pathname !== "/webhook") {
-      sendResponse(response, 404, "not found");
-      return;
-    }
-    readBody(request)
-      .then(async (rawBody) => {
-        if (
-          !verifyWebhookSignature(
-            config.webhookSecret,
-            rawBody,
-            request.headers["x-hub-signature-256"],
-          )
-        ) {
-          sendResponse(response, 401, "invalid signature");
-          return;
-        }
-        const event = request.headers["x-github-event"];
-        sendResponse(response, 202, "accepted");
-        setImmediate(() => {
-          handleWebhook(event, rawBody).catch((error) => {
-            console.error("Webhook handling failed:", error);
-          });
-        });
-      })
-      .catch((error) => {
-        console.error("Webhook read failed:", error);
-        sendResponse(response, 500, "error");
-      });
-  });
-
-  server.listen(config.port, () => {
-    console.log(`ai-fix bot listening on http://localhost:${config.port}/webhook`);
-  });
+    process.exitCode = 1;
+  }
 }
 
 export {
   buildFixPrompt,
   extractPatch,
-  verifyWebhookSignature,
 };
 
 const isMain =
@@ -641,7 +542,7 @@ const isMain =
   path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 if (isMain) {
-  main().catch((error) => {
+  runFromAction().catch((error) => {
     console.error(error);
     process.exitCode = 1;
   });

@@ -3,12 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "GitHub PR webhook bot that calls the DeepSeek API and pushes fixes.",
+  "description": "GitHub Action that calls the DeepSeek API to fix PR review comments.",
   "engines": {
     "node": ">=18.0.0"
   },
   "scripts": {
-    "start": "node index.js",
+    "ai-fix": "node run-ai-fix.mjs",
     "test": "node --test test/index.test.js"
   }
 }
